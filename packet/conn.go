@@ -1,9 +1,11 @@
 package packet
 
 import (
+	"bufio"
 	"bytes"
 	"io"
 	"net"
+	"sync"
 
 	"crypto/rand"
 	"crypto/rsa"
@@ -15,6 +17,29 @@ import (
 	. "github.com/siddontang/go-mysql/mysql"
 )
 
+type BufPool struct {
+	pool *sync.Pool
+}
+
+func NewBufPool() *BufPool {
+	return &BufPool{
+		pool: &sync.Pool{
+			New: func() interface{} {
+				return new(bytes.Buffer)
+			},
+		},
+	}
+}
+
+func (b *BufPool) Get() *bytes.Buffer {
+	return b.pool.Get().(*bytes.Buffer)
+}
+
+func (b *BufPool) Return(buf *bytes.Buffer) {
+	buf.Reset()
+	b.pool.Put(buf)
+}
+
 /*
 	Conn is the base class to handle MySQL protocol.
 */
@@ -24,40 +49,55 @@ type Conn struct {
 	// we removed the buffer reader because it will cause the SSLRequest to block (tls connection handshake won't be
 	// able to read the "Client Hello" data since it has been buffered into the buffer reader)
 
+	bufPool *BufPool
+	br      *bufio.Reader
+	reader  io.Reader
+
 	Sequence uint8
 }
 
 func NewConn(conn net.Conn) *Conn {
 	c := new(Conn)
-
 	c.Conn = conn
+
+	c.bufPool = NewBufPool()
+	c.br = bufio.NewReaderSize(c, 65536) // 64kb
+	c.reader = c.br
+
+	return c
+}
+
+func NewTLSConn(conn net.Conn) *Conn {
+	c := new(Conn)
+	c.Conn = conn
+
+	c.bufPool = NewBufPool()
+	c.reader = c
 
 	return c
 }
 
 func (c *Conn) ReadPacket() ([]byte, error) {
-	var buf bytes.Buffer
+	// Here we use `sync.Pool` to avoid allocate/destroy buffers frequently.
+	buf := c.bufPool.Get()
+	defer c.bufPool.Return(buf)
 
-	if err := c.ReadPacketTo(&buf); err != nil {
+	if err := c.ReadPacketTo(buf); err != nil {
 		return nil, errors.Trace(err)
 	} else {
-		return buf.Bytes(), nil
+		result := append([]byte{}, buf.Bytes()...)
+		return result, nil
 	}
 }
 
 func (c *Conn) ReadPacketTo(w io.Writer) error {
 	header := []byte{0, 0, 0, 0}
 
-	if _, err := io.ReadFull(c.Conn, header); err != nil {
-		return ErrBadConn
+	if _, err := io.ReadFull(c.reader, header); err != nil {
+		return errors.Wrapf(ErrBadConn, "io.ReadFull(header) failed. err %v", err)
 	}
 
 	length := int(uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16)
-	// bug fixed: caching_sha2_password will send 0-length payload (the unscrambled password) when the password is empty
-	//if length < 1 {
-	//	return errors.Errorf("invalid payload length %d", length)
-	//}
-
 	sequence := uint8(header[3])
 
 	if sequence != c.Sequence {
@@ -66,17 +106,22 @@ func (c *Conn) ReadPacketTo(w io.Writer) error {
 
 	c.Sequence++
 
-	if n, err := io.CopyN(w, c.Conn, int64(length)); err != nil {
-		return ErrBadConn
+	if buf, ok := w.(*bytes.Buffer); ok {
+		// Allocate the buffer with expected length directly instead of call `grow` and migrate data many times.
+		buf.Grow(length)
+	}
+
+	if n, err := io.CopyN(w, c.reader, int64(length)); err != nil {
+		return errors.Wrapf(ErrBadConn, "io.CopyN failed. err %v, copied %v, expected %v", err, n, length)
 	} else if n != int64(length) {
-		return ErrBadConn
+		return errors.Wrapf(ErrBadConn, "io.CopyN failed(n != int64(length)). %v bytes copied, while %v expected", n, length)
 	} else {
 		if length < MaxPayloadLen {
 			return nil
 		}
 
 		if err := c.ReadPacketTo(w); err != nil {
-			return err
+			return errors.Wrap(err, "ReadPacketTo failed")
 		}
 	}
 
@@ -96,9 +141,9 @@ func (c *Conn) WritePacket(data []byte) error {
 		data[3] = c.Sequence
 
 		if n, err := c.Write(data[:4+MaxPayloadLen]); err != nil {
-			return ErrBadConn
+			return errors.Wrapf(ErrBadConn, "Write(payload portion) failed. err %v", err)
 		} else if n != (4 + MaxPayloadLen) {
-			return ErrBadConn
+			return errors.Wrapf(ErrBadConn, "Write(payload portion) failed. only %v bytes written, while %v expected", n, 4+MaxPayloadLen)
 		} else {
 			c.Sequence++
 			length -= MaxPayloadLen
@@ -112,9 +157,9 @@ func (c *Conn) WritePacket(data []byte) error {
 	data[3] = c.Sequence
 
 	if n, err := c.Write(data); err != nil {
-		return ErrBadConn
+		return errors.Wrapf(ErrBadConn, "Write failed. err %v", err)
 	} else if n != len(data) {
-		return ErrBadConn
+		return errors.Wrapf(ErrBadConn, "Write failed. only %v bytes written, while %v expected", n, len(data))
 	} else {
 		c.Sequence++
 		return nil
@@ -132,7 +177,7 @@ func (c *Conn) WriteClearAuthPacket(password string) error {
 	copy(data[4:], password)
 	data[4+pktLen-1] = 0x00
 
-	return c.WritePacket(data)
+	return errors.Wrap(c.WritePacket(data), "WritePacket failed")
 }
 
 // WritePublicKeyAuthPacket: Caching sha2 authentication. Public key request and send encrypted password
@@ -141,17 +186,19 @@ func (c *Conn) WritePublicKeyAuthPacket(password string, cipher []byte) error {
 	// request public key
 	data := make([]byte, 4+1)
 	data[4] = 2 // cachingSha2PasswordRequestPublicKey
-	c.WritePacket(data)
+	if err := c.WritePacket(data); err != nil {
+		return errors.Wrap(err, "WritePacket(single byte) failed")
+	}
 
 	data, err := c.ReadPacket()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "ReadPacket failed")
 	}
 
 	block, _ := pem.Decode(data[1:])
 	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "x509.ParsePKIXPublicKey failed")
 	}
 
 	plain := make([]byte, len(password)+1)
@@ -164,15 +211,15 @@ func (c *Conn) WritePublicKeyAuthPacket(password string, cipher []byte) error {
 	enc, _ := rsa.EncryptOAEP(sha1v, rand.Reader, pub.(*rsa.PublicKey), plain, nil)
 	data = make([]byte, 4+len(enc))
 	copy(data[4:], enc)
-	return c.WritePacket(data)
+	return errors.Wrap(c.WritePacket(data), "WritePacket failed")
 }
 
 func (c *Conn) WriteEncryptedPassword(password string, seed []byte, pub *rsa.PublicKey) error {
 	enc, err := EncryptPassword(password, seed, pub)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "EncryptPassword failed")
 	}
-	return c.WriteAuthSwitchPacket(enc, false)
+	return errors.Wrap(c.WriteAuthSwitchPacket(enc, false), "WriteAuthSwitchPacket failed")
 }
 
 // http://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::AuthSwitchResponse
@@ -189,7 +236,7 @@ func (c *Conn) WriteAuthSwitchPacket(authData []byte, addNUL bool) error {
 		data[pktLen-1] = 0x00
 	}
 
-	return c.WritePacket(data)
+	return errors.Wrap(c.WritePacket(data), "WritePacket failed")
 }
 
 func (c *Conn) ResetSequence() {
@@ -199,7 +246,7 @@ func (c *Conn) ResetSequence() {
 func (c *Conn) Close() error {
 	c.Sequence = 0
 	if c.Conn != nil {
-		return c.Conn.Close()
+		return errors.Wrap(c.Conn.Close(), "Conn.Close failed")
 	}
 	return nil
 }
